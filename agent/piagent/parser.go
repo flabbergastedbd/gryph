@@ -25,12 +25,17 @@ type ToolCallInput struct {
 	Input      map[string]interface{} `json:"input"`
 }
 
+type ToolResultContent struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
 type ToolResultInput struct {
 	HookInput
 	ToolName   string                 `json:"tool_name"`
 	ToolCallID string                 `json:"tool_call_id"`
 	Input      map[string]interface{} `json:"input"`
-	Content    []interface{}          `json:"content"`
+	Content    []ToolResultContent    `json:"content"`
 	IsError    bool                   `json:"is_error"`
 }
 
@@ -108,7 +113,7 @@ func (a *Adapter) parseToolCall(sessionID uuid.UUID, agentSessionID string, base
 	event.WorkingDirectory = input.Cwd
 	event.RawEvent = rawData
 
-	if err := a.buildPayload(event, actionType, input.ToolName, input.Input, nil); err != nil {
+	if err := a.buildPayload(event, actionType, input.ToolName, input.Input); err != nil {
 		return nil, fmt.Errorf("failed to build payload: %w", err)
 	}
 
@@ -130,17 +135,17 @@ func (a *Adapter) parseToolResult(sessionID uuid.UUID, agentSessionID string, ba
 	event.WorkingDirectory = input.Cwd
 	event.RawEvent = rawData
 
-	toolResponse := make(map[string]interface{})
-	toolResponse["content"] = input.Content
-	toolResponse["is_error"] = input.IsError
-
-	if err := a.buildPayload(event, actionType, input.ToolName, input.Input, toolResponse); err != nil {
-		return nil, fmt.Errorf("failed to build payload: %w", err)
-	}
-
+	// Set result status first
 	event.ResultStatus = events.ResultSuccess
 	if input.IsError {
 		event.ResultStatus = events.ResultError
+	}
+
+	// Build minimal payload based on action type.
+	// For file_write, file_read, and command exec, the detailed handling of
+	// content and metadata is performed inside buildPayloadForResult.
+	if err := a.buildPayloadForResult(event, actionType, input.ToolName, input.Input, input.Content); err != nil {
+		return nil, fmt.Errorf("failed to build result payload: %w", err)
 	}
 
 	a.markSensitivePaths(event, actionType, input.Input)
@@ -199,7 +204,7 @@ func getActionType(toolName string) events.ActionType {
 	return events.ActionToolUse
 }
 
-func (a *Adapter) buildPayload(event *events.Event, actionType events.ActionType, toolName string, toolInput, toolResponse map[string]interface{}) error {
+func (a *Adapter) buildPayload(event *events.Event, actionType events.ActionType, toolName string, toolInput map[string]interface{}) error {
 	switch actionType {
 	case events.ActionFileRead:
 		payload := events.FileReadPayload{}
@@ -221,9 +226,10 @@ func (a *Adapter) buildPayload(event *events.Event, actionType events.ActionType
 			filePath = path
 		}
 
+		// Pi Agent uses oldText/newText fields for edits
 		fullContent, _ := toolInput["content"].(string)
-		fullOldStr, _ := toolInput["old_string"].(string)
-		fullNewStr, _ := toolInput["new_string"].(string)
+		fullOldStr, _ := toolInput["oldText"].(string)
+		fullNewStr, _ := toolInput["newText"].(string)
 
 		if a.contentHash {
 			if fullContent != "" {
@@ -233,8 +239,25 @@ func (a *Adapter) buildPayload(event *events.Event, actionType events.ActionType
 			}
 		}
 
+		// Line counting paths:
+		// 1. Edit (oldText/newText set): diff old vs new
+		// 2. Write to existing file, non-empty content: diff old file vs new content
+		// 3. Write to existing file, empty content: count old lines as removed
+		// 4. Write new file: count new lines
+		// Paths 3/4 use CountNewFileLines to avoid SplitLines("") phantom line bug
 		if fullOldStr != "" || fullNewStr != "" {
 			payload.LinesAdded, payload.LinesRemoved = utils.CountDiffLines(fullOldStr, fullNewStr)
+		} else if filePath != "" {
+			if data, err := os.ReadFile(filePath); err == nil {
+				oldContent := string(data)
+				if fullContent == "" {
+					payload.LinesRemoved = utils.CountNewFileLines(oldContent)
+				} else {
+					payload.LinesAdded, payload.LinesRemoved = utils.CountDiffLines(oldContent, fullContent)
+				}
+			} else if fullContent != "" {
+				payload.LinesAdded = utils.CountNewFileLines(fullContent)
+			}
 		} else if fullContent != "" {
 			payload.LinesAdded = utils.CountNewFileLines(fullContent)
 		}
@@ -256,6 +279,14 @@ func (a *Adapter) buildPayload(event *events.Event, actionType events.ActionType
 		if a.loggingLevel.IsAtLeast(config.LoggingFull) {
 			if fullOldStr != "" || fullNewStr != "" {
 				event.DiffContent = utils.GenerateDiff(filePath, fullOldStr, fullNewStr)
+			} else if filePath != "" {
+				oldContent := ""
+				if data, err := os.ReadFile(filePath); err == nil {
+					oldContent = string(data)
+				}
+				if oldContent != "" || fullContent != "" {
+					event.DiffContent = utils.GenerateDiff(filePath, oldContent, fullContent)
+				}
 			} else if fullContent != "" {
 				event.DiffContent = utils.GenerateDiff(filePath, "", fullContent)
 			}
@@ -269,15 +300,6 @@ func (a *Adapter) buildPayload(event *events.Event, actionType events.ActionType
 		if desc, ok := toolInput["description"].(string); ok {
 			payload.Description = desc
 		}
-		if toolResponse != nil {
-			if content, ok := toolResponse["content"].([]interface{}); ok && len(content) > 0 {
-				if textContent, ok := content[0].(map[string]interface{}); ok {
-					if text, ok := textContent["text"].(string); ok {
-						payload.Output = truncateString(text, 500)
-					}
-				}
-			}
-		}
 		if err := event.SetPayload(payload); err != nil {
 			return fmt.Errorf("failed to set payload: %w", err)
 		}
@@ -289,8 +311,73 @@ func (a *Adapter) buildPayload(event *events.Event, actionType events.ActionType
 		if input, err := json.Marshal(toolInput); err == nil {
 			payload.Input = input
 		}
-		if toolResponse != nil {
-			if resp, err := json.Marshal(toolResponse); err == nil {
+		if err := event.SetPayload(payload); err != nil {
+			return fmt.Errorf("failed to set payload: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// buildPayloadForResult builds minimal payload for tool_result events.
+// Unlike tool_call, tool_result should not duplicate the write details
+// (lines_added/lines_removed) - those were already captured in tool_call.
+// For file operations it only sets minimal path info; for command exec
+// it captures the output.
+func (a *Adapter) buildPayloadForResult(event *events.Event, actionType events.ActionType, toolName string, toolInput map[string]interface{}, content []ToolResultContent) error {
+	switch actionType {
+	case events.ActionFileRead:
+		// For reads, tool_call already captured path and pattern
+		// tool_result just marks success - no additional payload needed
+		payload := events.FileReadPayload{}
+		if path, ok := toolInput["path"].(string); ok {
+			payload.Path = path
+		}
+		if pattern, ok := toolInput["pattern"].(string); ok {
+			payload.Pattern = pattern
+		}
+		if err := event.SetPayload(payload); err != nil {
+			return fmt.Errorf("failed to set payload: %w", err)
+		}
+
+	case events.ActionFileWrite:
+		// For writes, tool_call already captured the write details
+		// Only set minimal path info to link with the tool_call event
+		payload := events.FileWritePayload{}
+		if path, ok := toolInput["path"].(string); ok {
+			payload.Path = path
+		}
+		// Don't set lines_added/lines_removed - those are in tool_call
+		if err := event.SetPayload(payload); err != nil {
+			return fmt.Errorf("failed to set payload: %w", err)
+		}
+
+	case events.ActionCommandExec:
+		// Capture output from result
+		payload := events.CommandExecPayload{}
+		if cmd, ok := toolInput["command"].(string); ok {
+			payload.Command = cmd
+		}
+		if desc, ok := toolInput["description"].(string); ok {
+			payload.Description = desc
+		}
+		if len(content) > 0 && content[0].Text != "" {
+			payload.Output = truncateString(content[0].Text, 500)
+		}
+		if err := event.SetPayload(payload); err != nil {
+			return fmt.Errorf("failed to set payload: %w", err)
+		}
+
+	default:
+		// For unknown tools, use generic tool use payload
+		payload := events.ToolUsePayload{
+			ToolName: toolName,
+		}
+		if input, err := json.Marshal(toolInput); err == nil {
+			payload.Input = input
+		}
+		if len(content) > 0 {
+			if resp, err := json.Marshal(content); err == nil {
 				payload.Output = resp
 			}
 		}
