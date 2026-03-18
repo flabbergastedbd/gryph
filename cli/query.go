@@ -4,11 +4,15 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/google/uuid"
 	"github.com/safedep/dry/log"
 	"github.com/safedep/gryph/core/events"
+	"github.com/safedep/gryph/storage"
 	"github.com/safedep/gryph/tui"
+	"github.com/safedep/gryph/tui/component/query"
 	"github.com/spf13/cobra"
 )
 
@@ -30,6 +34,7 @@ func NewQueryCmd() *cobra.Command {
 		offset      int
 		count       bool
 		sensitive   bool
+		interactive bool
 	)
 
 	cmd := &cobra.Command{
@@ -68,6 +73,11 @@ through the audit history.`,
 					log.Errorf("failed to close app: %w", err)
 				}
 			}()
+
+			if interactive {
+				return runInteractiveQuery(app, since, until, today, yesterday, agents, actions,
+					filePattern, cmdPattern, status, session, sensitive)
+			}
 
 			// Build filter
 			filter := events.NewEventFilter().WithLimit(limit).WithOffset(offset)
@@ -187,6 +197,54 @@ through the audit history.`,
 	cmd.Flags().IntVar(&offset, "offset", 0, "skip first n results")
 	cmd.Flags().BoolVar(&count, "count", false, "show count only")
 	cmd.Flags().BoolVar(&sensitive, "sensitive", false, "filter to events involving sensitive file access")
+	cmd.Flags().BoolVarP(&interactive, "interactive", "i", false, "launch interactive TUI browser")
 
 	return cmd
+}
+
+func runInteractiveQuery(app *App, since, until string, today, yesterday bool,
+	agents, actions []string, filePattern, cmdPattern, status, sessionID string, sensitive bool) error {
+
+	opts := query.Options{
+		Store:       app.Store,
+		Agents:      agents,
+		Actions:     actions,
+		FilePattern: filePattern,
+		CmdPattern:  cmdPattern,
+		Session:     sessionID,
+		Sensitive:   sensitive,
+	}
+
+	searcher, ok := app.Store.(storage.Searcher)
+	if !ok {
+		return fmt.Errorf("store does not support search, interactive mode requires FTS")
+	}
+	opts.Searcher = searcher
+
+	if today {
+		now := time.Now()
+		opts.Since = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).UTC()
+	} else if yesterday {
+		now := time.Now()
+		opts.Since = time.Date(now.Year(), now.Month(), now.Day()-1, 0, 0, 0, 0, now.Location()).UTC()
+		opts.Until = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).UTC()
+	} else if since != "" {
+		if t, err := parseDuration(since); err == nil {
+			opts.Since = t
+		}
+	}
+
+	if until != "" {
+		if t, err := parseDuration(until); err == nil {
+			opts.Until = t
+		}
+	}
+
+	if status != "" {
+		opts.Statuses = []string{status}
+	}
+
+	prog := tea.NewProgram(query.New(opts), tea.WithAltScreen())
+	_, err := prog.Run()
+	return err
 }

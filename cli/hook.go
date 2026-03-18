@@ -48,7 +48,7 @@ func NewHookCmd() *cobra.Command {
 			defer func() {
 				err := app.Close()
 				if err != nil {
-					log.Errorf("failed to close app: %w", err)
+					log.Errorf("failed to close app: %v", err)
 				}
 			}()
 
@@ -73,12 +73,6 @@ func NewHookCmd() *cobra.Command {
 			// Apply logging level filtering before saving
 			loggingLevel := app.Config.GetAgentLoggingLevel(agentName)
 			agent.ApplyLoggingLevel(event, loggingLevel)
-
-			// Evaluate security checks
-			securityResult := app.Security.Evaluate(ctx, event)
-			if !securityResult.IsAllowed() {
-				return sendSecurityBlockedResponse(agentName, hookType, securityResult)
-			}
 
 			// Get or create session using the session ID from the parsed event
 			sess, err := app.Store.GetSession(ctx, event.SessionID)
@@ -116,6 +110,30 @@ func NewHookCmd() *cobra.Command {
 				sess.TranscriptPath = event.TranscriptPath
 			}
 
+			// Evaluate security checks
+			securityResult := app.Security.Evaluate(ctx, event)
+			if !securityResult.IsAllowed() {
+				event.ResultStatus = events.ResultBlocked
+				event.ErrorMessage = securityResult.BlockReason
+				event.Sequence = sess.TotalActions + 1
+
+				if err := app.Store.SaveEvent(ctx, event); err != nil {
+					log.Errorf("failed to save blocked event: %v", err)
+				}
+
+				sess.TotalActions++
+				sess.BlockedActions++
+				if event.IsSensitive {
+					sess.SensitiveActions++
+				}
+
+				if err := app.Store.UpdateSession(ctx, sess); err != nil {
+					log.Errorf("failed to update session for blocked event: %v", err)
+				}
+
+				return sendSecurityBlockedResponse(agentName, hookType, securityResult)
+			}
+
 			// Set sequence number
 			event.Sequence = sess.TotalActions + 1
 
@@ -137,6 +155,10 @@ func NewHookCmd() *cobra.Command {
 
 			if event.ResultStatus == events.ResultError {
 				sess.Errors++
+			}
+
+			if event.IsSensitive {
+				sess.SensitiveActions++
 			}
 
 			if err := app.Store.UpdateSession(ctx, sess); err != nil {
@@ -179,7 +201,7 @@ func sendHookResponse(agentName, hookType string) error {
 		// Different hooks have different response schemas
 		response := generateCursorResponse(hookType)
 		if _, err := os.Stdout.Write(response); err != nil {
-			log.Errorf("failed to write to stdout: %w", err)
+			log.Errorf("failed to write to stdout: %v", err)
 		}
 
 		return nil
@@ -191,11 +213,11 @@ func sendHookResponse(agentName, hookType string) error {
 		if hookType == "BeforeTool" {
 			resp := gemini.NewAllowResponse()
 			if _, err := os.Stdout.Write(resp.JSON()); err != nil {
-				log.Errorf("failed to write to stdout: %w", err)
+				log.Errorf("failed to write to stdout: %v", err)
 			}
 		} else {
 			if _, err := os.Stdout.Write([]byte("{}")); err != nil {
-				log.Errorf("failed to write to stdout: %w", err)
+				log.Errorf("failed to write to stdout: %v", err)
 			}
 		}
 		return nil
@@ -249,7 +271,7 @@ func sendSecurityBlockedResponse(agentName, hookType string, result *security.Re
 		denyResponse := cursor.NewDenyResponse(result.BlockReason)
 		output := generateCursorBlockedResponse(hookType, denyResponse)
 		if _, err := os.Stdout.Write(output); err != nil {
-			log.Errorf("failed to write to stdout: %w", err)
+			log.Errorf("failed to write to stdout: %v", err)
 		}
 
 		return nil
